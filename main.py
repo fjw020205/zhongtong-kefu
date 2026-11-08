@@ -166,6 +166,7 @@ class App:
         self.log_text.grid(row=0, column=0, sticky="ew")
         self.log_text.tag_config("error", foreground="#c62828")
         self.log_text.tag_config("warn", foreground="#b26a00")
+        self.log_text.tag_config("info", foreground="#333333")
 
         self.status_var = tk.StringVar()
         ttk.Label(root, textvariable=self.status_var, relief="sunken", anchor="w", padding=(8, 4)).grid(
@@ -190,13 +191,18 @@ class App:
         self.btn_login.pack(side="left", padx=6)
         self.btn_detect = ttk.Button(buttons, text="检测客服页面", command=self._detect_chat)
         self.btn_detect.pack(side="left")
-        self.btn_close_browser = ttk.Button(buttons, text="关闭浏览器", command=self._close_browser)
+        self.btn_close_browser = ttk.Button(buttons, text="关闭浏览器窗口", command=self._close_browser)
         self.btn_close_browser.pack(side="left", padx=6)
 
         ttk.Label(
             frame,
-            text="提示：浏览器使用的是独立的本地配置目录，登录一次后会记住登录状态。",
+            text=(
+                "提示：登录状态保存在独立配置目录中；关闭本程序不会关闭浏览器窗口，"
+                "下次启动会直接复用同一个窗口，不需要重复登录。"
+            ),
             style="Hint.TLabel",
+            wraplength=520,
+            justify="left",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
     def _build_dify_frame(self, parent) -> None:
@@ -793,10 +799,8 @@ class App:
             return
         line = f"[{time.strftime('%H:%M:%S')}] {message}\n"
         self.log_text.configure(state="normal")
-        if level in ("error", "warn"):
-            self.log_text.insert("end", line, level)
-        else:
-            self.log_text.insert("end", line)
+        # 显式带上 level 标签，避免接着上一行（可能是 warn/error）继承颜色
+        self.log_text.insert("end", line, (level,))
         self.log_text.configure(state="disabled")
         self.log_text.see("end")
 
