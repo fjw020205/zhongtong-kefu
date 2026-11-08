@@ -1,0 +1,142 @@
+# 中通在线客服 · Dify 自动对话助手
+
+用 Python + Playwright + tkinter 实现的桌面工具：自动打开中通快递官网、进入在线客服对话框，并把每一条发给客服的消息交给 **Dify** 生成，实现多轮自动对话。
+
+- 登录由用户本人完成，脚本不处理账号密码 / 扫码
+- 只调用本机已安装的 Chrome / Edge（Chromium 内核），**不下载** Playwright 自带浏览器
+- 可打包成单个 `.exe` 分发
+
+## 功能概览
+
+| 步骤 | 界面按钮 | 实际行为 |
+| --- | --- | --- |
+| ① 启动浏览器 | 启动浏览器 | 用本机浏览器打开 `https://www.zto.com/`，登录态保存在独立配置目录 |
+| ② 用户登录 | —— | 由用户在浏览器中自行登录（登录后会跳到 `/myExpress`） |
+| ③ 进入客服 | 已登录 → 回首页并打开客服 | 先强制跳回首页，再自动点击首页右侧「在线客服」，进入 `https://kf.zto.com/` |
+| ④ 检测会话 | 检测客服页面 | 扫描所有页面/iframe，找到 `#sendText` 输入框后启用发送功能 |
+| ⑤ 自动对话 | 开始自动对话 | 收到客服回复 → 请求 Dify 生成下一条 → 自动发送，循环直到结束条件 |
+
+其他能力：
+
+- 手动「发送测试消息」，用于验证客服会话是否真的可用
+- 对话记录实时同步显示（区分「客服 / 我方」）
+- 运行日志 + 状态栏（浏览器、客服会话、自动对话状态）
+- 所有配置自动保存，下次启动自动回填
+
+## 环境要求
+
+- Windows 10 / 11
+- Python 3.9 及以上（建议 3.10+）
+- 本机已安装 Chrome 或 Edge
+- 一个可用的 **Dify 应用**（Chatflow / 聊天助手 / 文本生成 / 工作流均可）
+
+## 安装
+
+```powershell
+pip install -r requirements.txt
+```
+
+> 不需要执行 `playwright install`。脚本通过 `launch_persistent_context(executable_path=...)` 直接驱动本机浏览器。
+
+## 运行
+
+```powershell
+python main.py
+```
+
+## 使用流程
+
+1. **启动浏览器**：自动探测本机 Chrome，找不到则回退 Edge；若探测错误，可点「选择…」手动指定 `chrome.exe` / `msedge.exe`。
+2. **自己登录**：在弹出的浏览器窗口里完成中通账号登录（扫码/账号登录均可）。
+3. **点「已登录 → 回首页并打开客服」**：
+   - 脚本先把页面导航回 `https://www.zto.com/`（登录后站点默认停在 `/myExpress`）；
+   - 再点击首页右侧悬浮栏的「在线客服」按钮；
+   - 页面跳转到 `https://kf.zto.com/` 后，脚本自动检测输入框并提示「已检测到客服页面」，此时发送按钮可用。
+   - 如果浏览器里出现微信扫码登录弹窗，界面会提示「需要登录」，请先完成登录再点一次该按钮。
+4. **配置 Dify**（见下一节），点「测试连接」确认 Key 可用。
+5. **填对话目标**，例如「帮我把运单 SF1234567890 的派送时间提前到明天上午」，然后点「开始自动对话」。
+6. **可选**：填写「首条消息」，跳过 Dify 生成的第一句；留空则由 Dify 生成开场白。
+7. 自动对话过程中可随时点「停止」，或直接关闭浏览器（脚本会自动结束自动流程）。
+
+## Dify 配置说明
+
+| 字段 | 说明 |
+| --- | --- |
+| Base URL | 默认 `https://api.dify.ai/v1`；自建/私有化部署填自己的地址，省略 `/v1` 时会自动补 |
+| API Key | Dify 应用「访问 API」页面里的 `app-` 开头的 Key |
+| 应用类型 | 必须与 Dify 中创建的应用一致，否则 404 或拿不到输出 |
+| 用户标识 | 传给 Dify 的 `user` 字段，保持默认即可 |
+| 输入变量 | 默认 `{}`；只有 Dify 应用定义了输入变量时才需要填 JSON |
+| 保留 Dify 会话 | 勾选后会带 `conversation_id`，让 Dify 侧保留上下文 |
+
+应用类型与接口的对应关系：
+
+- `聊天助手 / Chatflow` → `POST /v1/chat-messages`
+- `文本生成` → `POST /v1/completion-messages`
+- `工作流` → `POST /v1/workflows/run`
+
+**脚本不指定模型**：模型由 Dify 应用自身的编排决定（例如在 Dify 里选了 `deepseek-flash`，脚本走的就是它）。「测试连接」只校验 `GET /v1/parameters`，不会验证模型是否可用。
+
+## 自动对话逻辑
+
+```
+开始 → （有新客服消息）→ 1.5 秒防抖合并 → 拼装 prompt → 请求 Dify
+     → 清洗输出 → 填 #sendText → 点击 #sendBtn → 等待下一条客服消息 → …
+```
+
+- Prompt 内容：角色设定 + 【本次目标】+ 【对话记录】（最近 12 条）+ 【输出要求】（只输出消息正文）
+- 结束条件（任一满足）：
+  - Dify 输出中包含 `[DONE]`（表示目标已完成 / 客服明确无法继续）
+  - 达到「最大轮数」（默认 10）
+  - 等待客服回复超时（默认 90 秒）
+  - 手动停止、客服会话断开、浏览器关闭、Dify 调用失败
+- 只接受「我方上次发送之后」新增的客服消息，避免把欢迎语误判为回复
+
+## 打包为 exe
+
+```powershell
+pip install pyinstaller
+pyinstaller --noconfirm --windowed --name ZtoKefuBot --collect-all playwright main.py
+```
+
+生成物：`dist\ZtoKefuBot\ZtoKefuBot.exe`。
+
+- `--collect-all playwright` 用于把 Playwright 驱动文件一起打进去
+- 依然不需要 `playwright install`，运行时会寻找本机浏览器
+- 打包后配置文件与浏览器数据仍在 `%APPDATA%\ZtoKefuBot\`
+
+## 文件结构
+
+```
+zhongtong-kefu/
+├── main.py           # tkinter 界面 + 自动对话状态机
+├── browser_bot.py    # Playwright 线程封装（启动/导航/点击/收发消息）
+├── dify_client.py    # Dify API 客户端（chat / completion / workflow）
+├── requirements.txt  # 依赖
+└── README.md
+```
+
+运行数据目录：`%APPDATA%\ZtoKefuBot\`
+
+- `config.json`：界面配置
+- `browser-profile\`：浏览器用户数据（登录态就存在这里，删除即退出登录）
+
+## 常见问题
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| 提示「未找到本机 Chrome / Edge」 | 点「选择…」手动指定浏览器 exe；或设置环境变量 `ZTO_BROWSER_PATH` |
+| 点击「在线客服」后弹出微信扫码 | 说明当前未登录，完成登录后重新点「已登录」按钮 |
+| 提示「未检测到客服输入框」 | 确认浏览器里已打开 `kf.zto.com` 且能看到输入框，再点「检测客服页面」 |
+| 点击在线客服后页面跳回首页 | 通常是登录态丢失，重新登录一次 |
+| Dify 报 401 | API Key 无效或未授权 |
+| Dify 报 404 | Base URL 或「应用类型」与 Dify 应用不匹配 |
+| 自动对话刚开始就结束 | 检查是否填了目标、客服是否回复、日志里有无 Dify 报错 |
+| 一直等不到客服回复 | 超过「回复超时」会自动结束；可调大该值或检查会话是否被转人工 |
+
+## 已验证范围
+
+- 本机浏览器启动 → 打开官网 → 点击在线客服 → 检测登录弹窗，全流程实机跑通
+- 客服页选择器（`#sendText`、`#sendBtn`、`#messageCont`）与消息读取逻辑实机验证
+- 自动对话状态机用 Mock Dify + Mock Worker 验证：两轮生成发送、`[DONE]` 结束
+- 未验证：登录后的真实多轮发送、真实 Dify Key 联调、exe 打包产物
