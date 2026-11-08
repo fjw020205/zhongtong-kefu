@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -47,6 +48,25 @@ DEFAULT_CONFIG = {
     "max_turns": 10,
     "reply_timeout": 90,
 }
+
+# 待投诉的中通运单号（脚本内维护）。列表为空或全无效时，随机模拟一个 12 位单号。
+ORDER_NUMBERS = [
+    "786543210987",
+    "789012345678",
+    "781234567890",
+    "785533117799",
+]
+
+# 单条消息字数上限：Dify 返回超过该长度时不发送，直接结束并报错。
+MAX_REPLY_CHARS = 20
+
+
+def pick_order_number() -> str:
+    """从维护的列表里取一个有效单号，取不到就模拟一个 12 位数字单号。"""
+    valid = [str(item).strip() for item in ORDER_NUMBERS if str(item).strip().isdigit()]
+    if valid:
+        return random.choice(valid)
+    return "7" + "".join(random.choice("0123456789") for _ in range(11))
 
 
 def load_config() -> dict:
@@ -85,6 +105,7 @@ class App:
         self.auto_max_turns = 10
         self.auto_reply_timeout = 90
         self.auto_goal = ""
+        self.auto_order_no = ""
         self.auto_history: list[tuple[str, str]] = []
         self.auto_conversation_id: str | None = None
         self.last_sent = ""
@@ -470,6 +491,7 @@ class App:
         self.auto_state = "starting"
         self.auto_turn = 0
         self.auto_goal = goal
+        self.auto_order_no = pick_order_number()
         self.auto_history = []
         self.auto_conversation_id = None
         self.last_sent = ""
@@ -480,7 +502,7 @@ class App:
         self._cancel_timers()
         self._refresh_controls()
         self._set_auto_status(f"自动对话：已开始（最多 {self.auto_max_turns} 轮）")
-        self._log(f"开始自动对话，目标：{goal}")
+        self._log(f"开始自动对话，目标：{goal}，订单号：{self.auto_order_no}")
 
         first = self.first_message_var.get().strip()
         if first:
@@ -598,6 +620,26 @@ class App:
         )
         return "\n".join(lines)
 
+    def _build_kefu_input(self, opening: bool) -> str:
+        """拼出 Dify workflow 的 kefuinput 变量：目标 + 订单号 + 对话上下文。"""
+        lines = [f"目标：{self.auto_goal}", f"订单号：{self.auto_order_no}"]
+        latest = ""
+        for role, text in reversed(self.auto_history):
+            if role == "客服":
+                latest = text
+                break
+        if opening or not latest:
+            lines.append("客服最新消息：（暂无）")
+        else:
+            lines.append(f"客服最新消息：{latest}")
+        lines.append("最近对话记录：")
+        history = self.auto_history[-12:]
+        if history:
+            lines.extend(f"{role}：{text}" for role, text in history)
+        else:
+            lines.append("（暂无）")
+        return "\n".join(lines)
+
     def _request_dify(self, opening: bool) -> None:
         try:
             snapshot = self._make_dify_snapshot()
@@ -605,6 +647,8 @@ class App:
             self._stop_auto(str(exc))
             return
         snapshot["conversation_id"] = self.auto_conversation_id
+        # workflow 应用只认 inputs，必须把上下文放进 kefuinput 才能驱动多轮
+        snapshot["inputs"] = {**snapshot["inputs"], "kefuinput": self._build_kefu_input(opening)}
         prompt = self._build_prompt(opening)
         self.auto_state = "generating"
         self._set_auto_status("自动对话：正在请求 Dify 生成消息…")
@@ -638,6 +682,10 @@ class App:
         message = self._clean_ai_message(raw)
         if not message:
             self._stop_auto("Dify 返回内容为空")
+            return
+        if len(message) > MAX_REPLY_CHARS:
+            preview = message[:60] + ("…" if len(message) > 60 else "")
+            self._stop_auto(f"Dify 回复 {len(message)} 字，超过 {MAX_REPLY_CHARS} 字上限，未发送：{preview}")
             return
         if conversation_id:
             self.auto_conversation_id = conversation_id
