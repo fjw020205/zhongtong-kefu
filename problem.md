@@ -22,6 +22,7 @@
 | P-07 | 11-08 20:3x | 运行报错 `name 'json' is not defined` | 回退代码时丢了 `import json` | 已修复 | v0.2.0 |
 | P-08 | 11-08 20:53 | `login-state.json` 不再更新，界面与日志完全无提示 | `_save_login_state()` 在周期调用时（`reason=""`）所有失败都静默 return | 已修复 | v0.2.1 |
 | P-09 | 11-08 20:50 | 测试脚本把"45 秒稳定"误判为"27.5 秒断开" | 测试脚本的 `break` 条件写在 `events.get` 成功分支后面，循环不按时间退出 | 已修复（测试脚本） | — |
+| P-10 | 11-08 23:20 | Dify 云端接入：答复里带 `<think>` 思维链；workflow 无输入变量；单次 17~26 秒 | 推理模型把思维链写进 `output`；应用 Start 节点没定义变量；`reply_timeout=30` 偏紧 | 思维链/超时已修复，输入变量待 Dify 侧补 | v0.2.3 |
 
 ---
 
@@ -99,6 +100,36 @@
 - 修复：时间判断放到 `while` 条件里，先算 `deadline`。
 - 反思：验证脚本本身也要验证；不要把"测试通过"当成结论，要看它到底测了什么。
 
+### P-10 Dify 云端 Workflow 接入
+
+- 现象：
+  1. `/workflows/run` 返回的 `outputs.output` 里整段是 `<think>…<!--dify-deepseek-reasoning-->…</think>` 推理过程；
+  2. `GET /parameters` 的 `user_input_form` 是空数组，客服的话无法作为 `inputs` 传入；
+  3. 单次调用实测 16.8s / 18.2s / 25.5s，而界面 `reply_timeout` 只有 30 秒。
+- 日志关键行：
+  ```
+  GET /parameters      200，user_input_form = []
+  POST /workflows/run  200 succeeded，elapsed 16.8s，outputs keys: ['output']
+  POST /chat-messages  400 {"code":"not_chat_app"}   ← 说明确实是 Workflow 应用，不是 Chatflow
+  ```
+- 原因分析：
+  1. 推理模型（DeepSeek）把思维链一起写进了输出变量，直接发出去会把推理过程暴露给对方；
+  2. 应用本身是 Workflow，开始节点没有定义变量，接口层只能传 `inputs={}`，因此每轮拿到的都是固定流程的结果；
+  3. 工作流节点多、模型推理慢，30 秒不够。
+- 修复：
+  1. `dify_client.py` 新增 `strip_reasoning()`：正则去掉成对的 `<think>` / `<thinking>`，未闭合的直接截断；`generate()` 的三个分支（completion / workflow / chat）返回前统一清洗；
+  2. `config.json` 的 `reply_timeout` 由 30 调到 60；
+  3. 输入变量属于 Dify 应用侧改动（在开始节点加文本变量，例如 `query`），程序侧等变量名确定后配置 `dify_inputs`。
+- 验证：
+  ```
+  PASS '<think>推理过程</think>最终答复' -> '最终答复'
+  PASS '<THINKING>a\nb</THINKING>\n\n最终答复' -> '最终答复'
+  PASS '<think>只有推理没有闭合' -> ''
+  PASS '正常答复' -> '正常答复'
+  workflow 调用 25.5s，清理后长度 3086，含 <think>：False
+  ```
+- 反思：对接第三方模型时，**"能返回结果"不等于"结果可直接用"**。先看原始响应结构（`outputs` 的键名、是否含思维链、耗时），再决定映射规则；把清洗做在客户端，不依赖应用侧配置。
+
 ---
 
 ## 三、打标签节点
@@ -108,6 +139,8 @@
 | v0.1.0 | 初始版本 | 界面、浏览器启动、客服页面检测、Dify 调用、自动对话 |
 | v0.2.0 | 复用本机浏览器窗口并保留登录态 | P-01 ~ P-07：WMI 脱离进程树、复用窗口、`browser_ready` 补发、`login-state.json` 保存/恢复、`storage_state()` 崩溃修复 |
 | v0.2.1 | 登录态保存失败可见 | P-08：保存失败必须打日志、首次成功提示、异常捕获放宽 |
+| v0.2.2 | Dify 云端接入前的基线 | 浏览器复用、登录态保存/恢复、关闭程序不关浏览器均已验证；Dify 云端连通性独立测试通过 |
+| v0.2.3 | 剥离思维链并放宽回复超时 | P-10：`strip_reasoning()`、`reply_timeout` 30 → 60 |
 
 规范：每次修复并验证通过后 → 提交代码 → 打 tag（`v0.x.y`）→ 在本文件补一条记录，写清"现象/根因/修复/验证"。
 

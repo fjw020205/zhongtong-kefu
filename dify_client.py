@@ -11,6 +11,23 @@ APP_CHAT = "chat"
 APP_COMPLETION = "completion"
 APP_WORKFLOW = "workflow"
 
+# DeepSeek 等推理模型会返回 <think>...</think> 思维链，发给客服前必须剥离
+THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.S | re.I)
+
+
+def strip_reasoning(text: str) -> str:
+    """去掉思维链，只保留最终答复；未闭合的 <think> 直接截断。"""
+    if not text:
+        return ""
+    cleaned = THINK_RE.sub("", text)
+    lower = cleaned.lower()
+    for tag in ("<think", "<thinking"):
+        idx = lower.find(tag)
+        if idx != -1:
+            cleaned = cleaned[:idx]
+            break
+    return cleaned.strip()
+
 
 class DifyError(RuntimeError):
     pass
@@ -95,7 +112,7 @@ class DifyClient:
                 "user": self.user,
             }
             data = self._request("POST", "/completion-messages", json=payload)
-            return (data.get("answer") or "").strip(), conversation_id
+            return strip_reasoning(data.get("answer") or ""), conversation_id
 
         if self.app_type == APP_WORKFLOW:
             data = self._request(
@@ -104,7 +121,7 @@ class DifyClient:
                 json={"inputs": inputs, "response_mode": "blocking", "user": self.user},
             )
             outputs = ((data.get("data") or {}).get("outputs")) or {}
-            return self._stringify_outputs(outputs), conversation_id
+            return strip_reasoning(self._stringify_outputs(outputs)), conversation_id
 
         payload = {
             "inputs": inputs,
@@ -115,7 +132,7 @@ class DifyClient:
         if conversation_id:
             payload["conversation_id"] = conversation_id
         data = self._request("POST", "/chat-messages", json=payload)
-        answer = (data.get("answer") or "").strip()
+        answer = strip_reasoning(data.get("answer") or "")
         new_conversation = data.get("conversation_id") or conversation_id
         return answer, new_conversation
 
