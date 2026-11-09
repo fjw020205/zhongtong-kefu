@@ -96,9 +96,23 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
+    """先写临时文件再原子替换，避免写入中断把 config.json 写坏。"""
     APP_HOME.mkdir(parents=True, exist_ok=True)
-    with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+    tmp_path = CONFIG_PATH.parent / (CONFIG_PATH.name + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
         json.dump(config, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, CONFIG_PATH)
+
+
+def safe_int(value, default: int, minimum: int, maximum: int) -> int:
+    """配置里的数字可能是字符串或脏数据，统一转换并夹到合法区间。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
 
 
 class App:
@@ -123,9 +137,13 @@ class App:
         self.auto_history: list[tuple[str, str]] = []
         self.auto_conversation_id: str | None = None
         self.last_sent = ""
+        # 批次令牌：停止或开启新一轮后，旧的分段发送链 / 旧的 Dify 请求必须作废
+        self.auto_send_token = 0
+        self.auto_generation = 0
 
         self._reply_job = None
         self._debounce_job = None
+        self._batch_job = None
         self._agent_buffer: dict[int, str] = {}
         self._closing = False
 
@@ -340,10 +358,10 @@ class App:
         options = ttk.Frame(parent)
         options.grid(row=4, column=0, sticky="ew")
         ttk.Label(options, text="最大轮数").pack(side="left")
-        self.max_turns_var = tk.IntVar(value=int(self.config.get("max_turns", 10)))
+        self.max_turns_var = tk.IntVar(value=safe_int(self.config.get("max_turns"), 10, 1, 50))
         ttk.Spinbox(options, from_=1, to=50, width=5, textvariable=self.max_turns_var).pack(side="left", padx=(4, 10))
         ttk.Label(options, text="回复超时(秒)").pack(side="left")
-        self.reply_timeout_var = tk.IntVar(value=int(self.config.get("reply_timeout", 90)))
+        self.reply_timeout_var = tk.IntVar(value=safe_int(self.config.get("reply_timeout"), 90, 10, 600))
         ttk.Spinbox(options, from_=10, to=600, width=5, textvariable=self.reply_timeout_var).pack(
             side="left", padx=(4, 0)
         )
@@ -511,8 +529,19 @@ class App:
         self.last_sent = ""
         self.auto_last_send_index = len(self.messages)
         self._agent_buffer = {}
-        self.auto_max_turns = max(1, int(self.max_turns_var.get() or 10))
-        self.auto_reply_timeout = max(10, int(self.reply_timeout_var.get() or 90))
+        # 开启新一轮：作废上一轮遗留的分段发送链与 Dify 请求
+        self.auto_send_token += 1
+        self.auto_generation += 1
+        try:
+            turns = int(self.max_turns_var.get())
+        except (tk.TclError, ValueError):
+            turns = 10
+        try:
+            timeout = int(self.reply_timeout_var.get())
+        except (tk.TclError, ValueError):
+            timeout = 90
+        self.auto_max_turns = max(1, min(50, turns))
+        self.auto_reply_timeout = max(10, min(600, timeout))
         self._cancel_timers()
         self._refresh_controls()
         self._set_auto_status(f"自动对话：已开始（最多 {self.auto_max_turns} 轮）")
@@ -536,7 +565,7 @@ class App:
             self._log(f"自动对话结束：{reason}")
 
     def _cancel_timers(self) -> None:
-        for attr in ("_reply_job", "_debounce_job"):
+        for attr in ("_reply_job", "_debounce_job", "_batch_job"):
             job = getattr(self, attr)
             if job is not None:
                 try:
@@ -572,19 +601,23 @@ class App:
         self.auto_state = "waiting"
         self.last_sent = texts[-1]
         self.auto_last_send_index = len(self.messages)
+        self.auto_send_token += 1
+        token = self.auto_send_token
         for item in texts:
             self.auto_history.append(("我方", item))
         self._set_auto_status(f"自动对话：已发送第 {self.auto_turn} 轮，等待客服回复…")
 
         def send_at(index: int) -> None:
-            if not self.auto_running:
+            self._batch_job = None
+            # 停止或已开始新一轮时，旧批次立刻作废，不能继续往新会话里发
+            if not self.auto_running or token != self.auto_send_token:
                 return
             if index >= len(texts):
                 self._arm_reply_timeout()
                 return
             self.worker.commands.put({"type": "send", "text": texts[index]})
             self._log(f"第 {self.auto_turn} 轮发送（{index + 1}/{len(texts)}）：{texts[index]}")
-            self.root.after(800, lambda: send_at(index + 1))
+            self._batch_job = self.root.after(800, lambda: send_at(index + 1))
 
         send_at(0)
 
@@ -614,9 +647,16 @@ class App:
 
     def _on_agent_reply_ready(self) -> None:
         self._debounce_job = None
+        if not self.auto_running or self.auto_state != "waiting":
+            self._agent_buffer = {}
+            return
+        if self._batch_job is not None:
+            # 上一批分段还没发完，客服就回复了：等发完再处理，避免两批消息交错
+            self._debounce_job = self.root.after(500, self._on_agent_reply_ready)
+            return
         texts = [self._agent_buffer[key] for key in sorted(self._agent_buffer) if self._agent_buffer[key]]
         self._agent_buffer = {}
-        if not self.auto_running or self.auto_state != "waiting" or not texts:
+        if not texts:
             return
         if self._reply_job is not None:
             try:
@@ -692,10 +732,14 @@ class App:
         snapshot["inputs"] = {**snapshot["inputs"], "kefuinput": self._build_kefu_input(opening)}
         prompt = self._build_prompt(opening)
         self.auto_state = "generating"
+        self.auto_generation += 1
+        generation = self.auto_generation
         self._set_auto_status("自动对话：正在请求 Dify 生成消息…")
-        threading.Thread(target=self._dify_worker, args=(prompt, snapshot), daemon=True).start()
+        threading.Thread(
+            target=self._dify_worker, args=(prompt, snapshot, generation), daemon=True
+        ).start()
 
-    def _dify_worker(self, prompt: str, snapshot: dict) -> None:
+    def _dify_worker(self, prompt: str, snapshot: dict, generation: int) -> None:
         try:
             client = DifyClient(
                 snapshot["base_url"],
@@ -705,12 +749,15 @@ class App:
             )
             conversation_id = snapshot["conversation_id"] if snapshot["use_conversation"] else None
             answer, new_conversation_id = client.generate(prompt, snapshot["inputs"], conversation_id)
-            self.ui_tasks.put(lambda: self._on_dify_success(answer, new_conversation_id))
+            self.ui_tasks.put(lambda: self._on_dify_success(answer, new_conversation_id, generation))
         except Exception as exc:  # noqa: BLE001
             message = str(exc)
-            self.ui_tasks.put(lambda: self._on_dify_failure(message))
+            self.ui_tasks.put(lambda: self._on_dify_failure(message, generation))
 
-    def _on_dify_success(self, answer: str, conversation_id: str | None) -> None:
+    def _on_dify_success(self, answer: str, conversation_id: str | None, generation: int) -> None:
+        if generation != self.auto_generation:
+            self._log("已忽略上一轮 Dify 的过期结果", level="warn")
+            return
         if not self.auto_running or self.auto_state != "generating":
             return
         raw = (answer or "").strip()
@@ -740,7 +787,9 @@ class App:
         self._log(f"Dify 生成：{message}")
         self._send_auto_batch(segments)
 
-    def _on_dify_failure(self, message: str) -> None:
+    def _on_dify_failure(self, message: str, generation: int) -> None:
+        if generation != self.auto_generation:
+            return
         if not self.auto_running:
             return
         self._stop_auto(f"Dify 调用失败：{message}")
@@ -761,22 +810,29 @@ class App:
     def _poll_events(self) -> None:
         if self._closing:
             return
-        while True:
-            try:
-                task = self.ui_tasks.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                task()
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"界面回调异常：{exc}", level="error")
-        while True:
-            try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_event(event)
-        self.root.after(120, self._poll_events)
+        try:
+            while True:
+                try:
+                    task = self.ui_tasks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    task()
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"界面回调异常：{exc}", level="error")
+            while True:
+                try:
+                    event = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_event(event)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"处理事件失败（{event.get('type')}）：{exc}", level="error")
+        finally:
+            # 只要没关闭就续约，否则单条事件异常会让界面永久假死
+            if not self._closing:
+                self.root.after(120, self._poll_events)
 
     def _handle_event(self, event: dict) -> None:
         kind = event.get("type")
@@ -819,6 +875,9 @@ class App:
         elif kind == "chat_reset":
             self.messages = []
             self._render_messages()
+            # 与 chat_ready 对齐：浏览器侧消息索引已从头开始，界面基准也要归零
+            self._agent_buffer = {}
+            self.auto_last_send_index = 0
         elif kind == "chat_new":
             self._on_chat_new(event.get("items", []))
         elif kind == "chat_update":
