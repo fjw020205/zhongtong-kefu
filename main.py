@@ -57,8 +57,22 @@ ORDER_NUMBERS = [
     "785533117799",
 ]
 
-# 单条消息字数上限：Dify 返回超过该长度时不发送，直接结束并报错。
+# 单条消息字数上限：超过则按标点拆成多条逐条发送。
 MAX_REPLY_CHARS = 20
+
+
+def split_message(text: str, limit: int = MAX_REPLY_CHARS) -> list[str]:
+    """按句号/问号/逗号/换行把一段回复拆成多条短消息，每条不超过 limit 字。"""
+    parts = re.split(r"[。！？；!?;\n]+|(?<=[，,、])", (text or "").strip())
+    segments: list[str] = []
+    for part in parts:
+        piece = part.strip().strip("，,、 ")
+        while len(piece) > limit:
+            segments.append(piece[:limit])
+            piece = piece[limit:]
+        if piece:
+            segments.append(piece)
+    return segments
 
 
 def pick_order_number() -> str:
@@ -541,15 +555,38 @@ class App:
         if not text:
             self._stop_auto("生成内容为空")
             return
+        self._send_auto_batch([text])
+
+    def _send_auto_batch(self, texts: list[str]) -> None:
+        """把一条长回复拆成多条短消息，按顺序逐条发送，整批算一轮。"""
+        if not self.auto_running:
+            return
+        if self.auto_turn >= self.auto_max_turns:
+            self._stop_auto(f"已达到最大轮数（{self.auto_max_turns}）")
+            return
+        texts = [t for t in texts if t]
+        if not texts:
+            self._stop_auto("生成内容为空")
+            return
         self.auto_turn += 1
         self.auto_state = "waiting"
-        self.last_sent = text
+        self.last_sent = texts[-1]
         self.auto_last_send_index = len(self.messages)
-        self.auto_history.append(("我方", text))
-        self.worker.commands.put({"type": "send", "text": text})
+        for item in texts:
+            self.auto_history.append(("我方", item))
         self._set_auto_status(f"自动对话：已发送第 {self.auto_turn} 轮，等待客服回复…")
-        self._log(f"第 {self.auto_turn} 轮发送：{text}")
-        self._arm_reply_timeout()
+
+        def send_at(index: int) -> None:
+            if not self.auto_running:
+                return
+            if index >= len(texts):
+                self._arm_reply_timeout()
+                return
+            self.worker.commands.put({"type": "send", "text": texts[index]})
+            self._log(f"第 {self.auto_turn} 轮发送（{index + 1}/{len(texts)}）：{texts[index]}")
+            self.root.after(800, lambda: send_at(index + 1))
+
+        send_at(0)
 
     def _arm_reply_timeout(self) -> None:
         if self._reply_job is not None:
@@ -629,7 +666,11 @@ class App:
                 latest = text
                 break
         if opening or not latest:
-            lines.append("客服最新消息：（暂无）")
+            # 开场必须明确“客服还没说话”，否则模型会把自己当成客服、反过来索要我方信息
+            lines.append(
+                "客服最新消息：（客服尚未发言。请直接输出你要对客服说的第一句话，"
+                "不要索要订单号、对话记录等任何信息，不要出现变量名）"
+            )
         else:
             lines.append(f"客服最新消息：{latest}")
         lines.append("最近对话记录：")
@@ -683,14 +724,21 @@ class App:
         if not message:
             self._stop_auto("Dify 返回内容为空")
             return
-        if len(message) > MAX_REPLY_CHARS:
-            preview = message[:60] + ("…" if len(message) > 60 else "")
-            self._stop_auto(f"Dify 回复 {len(message)} 字，超过 {MAX_REPLY_CHARS} 字上限，未发送：{preview}")
+        if "kefuinput" in message.lower():
+            self._stop_auto(f"Dify 回复里出现了变量名，未发送：{message[:60]}")
+            return
+        if self.auto_turn == 0 and re.search(r"请(提供|输入|告知|发送)", message):
+            # 开场时模型把自己当成客服、向我方索要信息——这种话不能发给客服
+            self._log("Dify 开场回复是在索要信息，已改用固定开场：你好", level="warn")
+            message = "你好"
+        segments = split_message(message, MAX_REPLY_CHARS)
+        if not segments:
+            self._stop_auto("Dify 返回内容为空")
             return
         if conversation_id:
             self.auto_conversation_id = conversation_id
         self._log(f"Dify 生成：{message}")
-        self._send_auto(message)
+        self._send_auto_batch(segments)
 
     def _on_dify_failure(self, message: str) -> None:
         if not self.auto_running:
@@ -753,6 +801,12 @@ class App:
             messagebox.showwarning("需要登录", message)
         elif kind == "chat_ready":
             self.chat_ready = True
+            # 浏览器侧每次绑定客服页都会把消息列表清零（索引从 0 重新计数），
+            # 界面必须同步清空，否则 auto_last_send_index 会大于新索引，客服回复全被过滤。
+            self.messages = []
+            self._render_messages()
+            self._agent_buffer = {}
+            self.auto_last_send_index = 0
             self._log(message)
             self._refresh_controls()
         elif kind == "chat_pending":

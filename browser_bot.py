@@ -680,15 +680,24 @@ class BrowserWorker(threading.Thread):
         self._emit("browser_status", message=f"已回到首页：{page.url}")
 
     def _cmd_login_done(self) -> None:
-        """用户确认已登录：先回首页，再自动点击“在线客服”。"""
+        """用户确认已登录：已有客服会话就复用，没有才回首页点击“在线客服”。"""
         if not self._ctx:
             self._emit("error", message="请先启动浏览器")
             return
         try:
-            self._cmd_goto_home()
             # 用户此刻已登录，立刻存一份登录态，避免之后浏览器被关闭导致登录丢失
             self._next_state_save = time.time() + STATE_SAVE_INTERVAL
             self._save_login_state()
+            page, frame = self._find_chat_frame()
+            if frame is not None:
+                # 复用已打开的客服标签页：再点一次“在线客服”会多开一个标签页，
+                # 两个标签页的消息索引互相错位，客服回复就会被漏掉。
+                self._chat_page, self._chat_frame = page, frame
+                self._messages = []
+                self._emit("chat_ready", message=f"已复用已打开的客服会话：{_short_url(page.url)}")
+                self._poll_messages()
+                return
+            self._cmd_goto_home()
             self._cmd_open_service()
         except PlaywrightError as exc:
             self._emit("error", message=f"进入客服失败：{exc}")
@@ -773,22 +782,36 @@ class BrowserWorker(threading.Thread):
         else:
             self._emit("chat_pending", message="未检测到客服输入框，请确认已打开 kf.zto.com 客服页面")
 
+    def _frame_with_chat(self, page):
+        try:
+            frames = page.frames
+        except PlaywrightError:
+            return None
+        for frame in frames:
+            try:
+                if frame.locator("#sendText").count():
+                    return frame
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
     def _find_chat_frame(self):
         if self._ctx is None:
             return None, None
-        for page in list(self._ctx.pages):
-            if page.is_closed():
-                continue
-            try:
-                frames = page.frames
-            except PlaywrightError:
-                continue
-            for frame in frames:
-                try:
-                    if frame.locator("#sendText").count():
-                        return page, frame
-                except Exception:  # noqa: BLE001
-                    continue
+        try:
+            pages = [p for p in self._ctx.pages if not p.is_closed()]
+        except PlaywrightError:
+            return None, None
+        # 先认当前正在用的客服标签页，避免在多个客服标签页之间来回切换
+        if self._chat_page is not None and self._chat_page in pages:
+            frame = self._frame_with_chat(self._chat_page)
+            if frame is not None:
+                return self._chat_page, frame
+        # 否则取最新的客服标签页（ctx.pages 里越靠后越新）
+        for page in reversed(pages):
+            frame = self._frame_with_chat(page)
+            if frame is not None:
+                return page, frame
         return None, None
 
     # ------------------------------------------------------------------ 发送
