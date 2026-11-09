@@ -615,8 +615,23 @@ class BrowserWorker(threading.Thread):
         cookies = [c for c in data.get("cookies", []) if "zto.com" in (c.get("domain") or "")]
         if cookies:
             try:
-                ctx.add_cookies(cookies)
-                self._emit("log", message=f"已恢复上次的登录状态（{len(cookies)} 个 cookie）")
+                # 只补缺失的 cookie：浏览器里已有的是用户刚登录产生的新值，
+                # 用旧快照覆盖会把刚登录的会话冲掉。
+                existing = {
+                    (c.get("name"), c.get("domain"), c.get("path"))
+                    for c in ctx.cookies()
+                    if "zto.com" in (c.get("domain") or "")
+                }
+                missing = [
+                    c
+                    for c in cookies
+                    if (c.get("name"), c.get("domain"), c.get("path")) not in existing
+                ]
+                if missing:
+                    ctx.add_cookies(missing)
+                    self._emit("log", message=f"已恢复上次的登录状态（{len(missing)} 个 cookie）")
+                elif existing:
+                    self._emit("log", message="浏览器已处于登录状态，跳过 cookie 恢复")
             except Exception as exc:  # noqa: BLE001
                 self._emit("log", message=f"恢复登录 cookie 失败：{exc}")
 
@@ -719,7 +734,8 @@ class BrowserWorker(threading.Thread):
             if frame is not None:
                 self._chat_page, self._chat_frame = page, frame
                 self._messages = []
-                self._emit("chat_ready", message=f"已进入在线客服：{page.url}")
+                # 客服页 URL 带 authToken / 手机号，日志里只保留域名和路径
+                self._emit("chat_ready", message=f"已进入在线客服：{_short_url(page.url)}")
                 self._poll_messages()
                 return True
             if not login_hinted and self._login_modal_visible():
