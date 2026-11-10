@@ -637,7 +637,7 @@ class BrowserWorker(threading.Thread):
                 ]
                 critical_names = {"OFFICIAL_TOKEN", "customerId", "userid"}
                 restored_critical = [c.get("name") for c in missing if c.get("name") in critical_names]
-                had_critical = [c.get("name") for c in existing if c[0] in critical_names]
+                had_critical = [c[0] for c in existing if c[0] in critical_names]
                 if missing:
                     extra = ""
                     if "OFFICIAL_TOKEN" in restored_critical:
