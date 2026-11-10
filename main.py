@@ -774,6 +774,21 @@ class App:
         if "kefuinput" in message.lower():
             self._stop_auto(f"Dify 回复里出现了变量名，未发送：{message[:60]}")
             return
+        # 拦截 Dify 把 System Prompt 里的内部判断规则当成正文输出
+        # 例如"系统识别：要求包裹拒收,闲聊,要求转人工"——这是模型在复述自己的判断依据，不是要发给客服的话
+        leaked_meta = re.match(
+            r"^(系统识别|内部规则|判断|判定|识别要点|规则|输出要求|任务说明)[：:]",
+            message,
+        )
+        if leaked_meta:
+            self._log(
+                f"Dify 回复是内部规则泄漏，已拦截：{message[:60]}",
+                level="warn",
+            )
+            if self.auto_turn == 0:
+                message = "你好"
+            else:
+                message = "麻烦帮我处理一下"
         if self.auto_turn == 0 and re.search(r"请(提供|输入|告知|发送)", message):
             # 开场时模型把自己当成客服、向我方索要信息——这种话不能发给客服
             self._log("Dify 开场回复是在索要信息，已改用固定开场：你好", level="warn")

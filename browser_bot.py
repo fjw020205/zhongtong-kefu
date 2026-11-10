@@ -594,11 +594,19 @@ class BrowserWorker(threading.Thread):
             return
 
         self._last_state_error = ""
+        # 关键登录 cookie：快照里必须有 OFFICIAL_TOKEN 才能在下次启动后自动恢复登录
+        critical_names = {"OFFICIAL_TOKEN", "customerId", "userid"}
+        found_critical = [c.get("name") for c in cookies if c.get("name") in critical_names]
         if not self._state_saved_once:
             self._state_saved_once = True
+            extra = ""
+            if "OFFICIAL_TOKEN" in found_critical:
+                extra = "（包含登录凭证 OFFICIAL_TOKEN，下次启动可自动恢复登录）"
+            else:
+                extra = "⚠ 快照中未包含登录凭证 OFFICIAL_TOKEN，浏览器关闭后重启脚本可能需要重新登录"
             self._emit(
                 "log",
-                message=f"登录状态已保存到本地（{len(cookies)} 个 cookie），下次启动会自动恢复",
+                message=f"登录状态已保存到本地（{len(cookies)} 个 cookie）{extra}",
             )
 
     def _load_login_state(self) -> None:
@@ -627,11 +635,26 @@ class BrowserWorker(threading.Thread):
                     for c in cookies
                     if (c.get("name"), c.get("domain"), c.get("path")) not in existing
                 ]
+                critical_names = {"OFFICIAL_TOKEN", "customerId", "userid"}
+                restored_critical = [c.get("name") for c in missing if c.get("name") in critical_names]
+                had_critical = [c.get("name") for c in existing if c[0] in critical_names]
                 if missing:
+                    extra = ""
+                    if "OFFICIAL_TOKEN" in restored_critical:
+                        extra = "（已补回 OFFICIAL_TOKEN）"
+                    elif "OFFICIAL_TOKEN" in had_critical:
+                        extra = "（浏览器内存中已有 OFFICIAL_TOKEN，无需补回）"
+                    else:
+                        extra = "⚠ 快照与浏览器内存中均无 OFFICIAL_TOKEN，可能需要重新登录"
                     ctx.add_cookies(missing)
-                    self._emit("log", message=f"已恢复上次的登录状态（{len(missing)} 个 cookie）")
+                    self._emit("log", message=f"已恢复上次的登录状态（{len(missing)} 个 cookie）{extra}")
                 elif existing:
-                    self._emit("log", message="浏览器已处于登录状态，跳过 cookie 恢复")
+                    extra = ""
+                    if "OFFICIAL_TOKEN" in had_critical:
+                        extra = "（浏览器内存中已有 OFFICIAL_TOKEN）"
+                    else:
+                        extra = "⚠ 浏览器内存中无 OFFICIAL_TOKEN，可能需要重新登录"
+                    self._emit("log", message=f"浏览器已处于登录状态，跳过 cookie 恢复{extra}")
             except Exception as exc:  # noqa: BLE001
                 self._emit("log", message=f"恢复登录 cookie 失败：{exc}")
 
